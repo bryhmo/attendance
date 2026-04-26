@@ -1,0 +1,19 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Sessions collection — teachers write, students read & append their check-in
+    match /sessions/{classId} {
+
+      // Any logged-in user can read sessions (student needs to match token)
+      allow read: if request.auth != null;
+
+      // Only authenticated users can create or fully update a session
+      // (In production you'd verify teacher role via custom claims)
+      allow create, update: if request.auth != null;
+
+      // No one can delete sessions through the client
+      allow delete: if false;
+    }
+  }
+}
