@@ -5,51 +5,74 @@ import {
   onAuthStateChanged,
 } from "firebase/auth";
 import {
-  doc, collection, setDoc, updateDoc,
+  doc, collection, setDoc, updateDoc, getDoc,
   onSnapshot, arrayUnion, serverTimestamp,
 } from "firebase/firestore";
 import { auth, db } from "./firebase";
 
-/* ─── Static data ────────────────────────────────────────────────────────────── */
-const USERS = [
-  { id:"T001", name:"Prof. Dr Rashidah Funke Olarenwaju ",   role:"teacher", email:"rashidah@school.edu",  avatar:"DA" },
-  { id:"T002", name:"Prof. Okonkwo", role:"teacher", email:"okonkwo@school.edu",  avatar:"PO" },
-  { id:"S001", name:"Asikhalaye Ehijiator Napoleon",  role:"student", email:"napoleon@school.edu",    avatar:"AEN", studentId:"AMS25CMS0010" },
-  { id:"S002", name:"Isiaka Ibrahim AbdulRoheem",   role:"student", email:"ibrahim@school.edu",    avatar:"IIA", studentId:"AMS25CMS0008" },
-  { id:"S003", name:"Fatima Bello",  role:"student", email:"fatima@school.edu",   avatar:"FB", studentId:"STU003" },
-  { id:"S004", name:"Emeka Adeyemi", role:"student", email:"emeka@school.edu",    avatar:"EA", studentId:"STU004" },
-  { id:"S005", name:"Ngozi Eze",     role:"student", email:"ngozi@school.edu",    avatar:"NE", studentId:"STU005" },
-  { id:"S006", name:"Tunde Abiodun", role:"student", email:"tunde@school.edu",    avatar:"TA", studentId:"STU006" },
-  { id:"S007", name:"Halima Musa",   role:"student", email:"halima@school.edu",   avatar:"HM", studentId:"STU007" },
-  { id:"S008", name:"Seun Olawale",  role:"student", email:"seun@school.edu",     avatar:"SO", studentId:"STU008" },
-];
-const STUDENTS = USERS.filter(u => u.role === "student");
-const CLASSES  = [
-  { id:"CS301", name:"Data Structures",  teacher:"T001" },
-  { id:"CS302", name:"Web Engineering",  teacher:"T002" },
-  { id:"CS303", name:"Database Systems", teacher:"T001" },
-];
-
-function getUserProfile(firebaseUser) {
-  return USERS.find(u => u.email === firebaseUser.email) || null;
+/* ─── Helpers ────────────────────────────────────────────────────────────────── */
+// Derive a Firestore doc ID from an email  e.g. amara@school.edu → amara_at_school_edu
+function emailToDocId(email) {
+  return email.replace("@", "_at_").replace(/\./g, "_");
 }
-function qrUrl(token) {
-  return `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(token)}&bgcolor=ffffff&color=0a0a0f&qzone=2`;
+
+async function fetchUserProfile(firebaseUser) {
+  const docId = emailToDocId(firebaseUser.email);
+  const snap  = await getDoc(doc(db, "users", docId));
+  if (!snap.exists()) return null;
+  const data = snap.data();
+  // Normalise field names so the rest of the app works unchanged
+  return {
+    ...data,
+    // 'studentId' used throughout the app — map from matricNo for students
+    studentId: data.matricNo || data.staffId || docId,
+    // 'name' used in UI — map from shortName
+    name: data.shortName || data.fullName,
+  };
+}
+/* Generate QR code locally on a canvas using qrcode.js loaded from CDN */
+function QRCanvas({ token, size = 200 }) {
+  const canvasRef = useRef(null);
+  useEffect(() => {
+    if (!token) return;
+    const render = () => {
+      if (!window.QRCode || !canvasRef.current) return;
+      canvasRef.current.getContext("2d").clearRect(0, 0, size, size);
+      window.QRCode.toCanvas(canvasRef.current, token, {
+        width: size, margin: 2,
+        color: { dark: "#0a0a0f", light: "#ffffff" }
+      }, (err) => { if (err) console.error("QR render error:", err); });
+    };
+    if (window.QRCode) { render(); return; }
+    // Load qrcode.js from CDN if not already loaded
+    const s = document.createElement("script");
+    s.src = "https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js";
+    s.onload = render;
+    s.onerror = () => {
+      // fallback CDN
+      const s2 = document.createElement("script");
+      s2.src = "https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.min.js";
+      s2.onload = render;
+      document.head.appendChild(s2);
+    };
+    document.head.appendChild(s);
+  }, [token, size]);
+  return <canvas ref={canvasRef} width={size} height={size} style={{borderRadius:8}}/>;
 }
 function genToken(cid) {
   return `ATT-${cid}-${Date.now()}-${Math.random().toString(36).slice(2,7).toUpperCase()}`;
 }
 
 /* ─── Export helpers ─────────────────────────────────────────────────────────── */
-function exportCSV(sessions) {
-  const rows = [["Student ID","Name","Class","Subject","Date","Time","Status"]];
-  CLASSES.forEach(cls => {
+function exportCSV(sessions, students, classes) {
+  const rows = [["Matric No","Full Name","Class","Subject","Date","Time","Status"]];
+  (classes||[]).forEach(cls => {
     const s = sessions[cls.id];
     if (!s) return;
     const date = new Date(s.createdAt?.toDate?.() || s.createdAt).toLocaleDateString();
-    STUDENTS.forEach(st => {
+    (students||[]).forEach(st => {
       const rec = (s.scanned||[]).find(x => x.studentId === st.studentId);
-      rows.push([st.studentId, st.name, cls.id, cls.name, date, rec ? rec.time : "-", rec ? "Present" : "Absent"]);
+      rows.push([st.studentId, st.fullName || st.name, cls.id, cls.name, date, rec ? rec.time : "-", rec ? "Present" : "Absent"]);
     });
   });
   const csv  = rows.map(r => r.map(c => `"${c}"`).join(",")).join("\n");
@@ -59,15 +82,15 @@ function exportCSV(sessions) {
   URL.revokeObjectURL(url);
 }
 
-function exportPDF(sessions) {
+function exportPDF(sessions, students, classes) {
   const rows = [];
-  CLASSES.forEach(cls => {
+  (classes||[]).forEach(cls => {
     const s = sessions[cls.id];
     if (!s) return;
     const date = new Date(s.createdAt?.toDate?.() || s.createdAt).toLocaleDateString();
-    STUDENTS.forEach(st => {
+    (students||[]).forEach(st => {
       const rec = (s.scanned||[]).find(x => x.studentId === st.studentId);
-      rows.push({ id:st.studentId, name:st.name, cls:cls.name, date, time:rec?rec.time:"-", status:rec?"Present":"Absent" });
+      rows.push({ id:st.studentId, name:st.fullName||st.name, cls:cls.name, date, time:rec?rec.time:"-", status:rec?"Present":"Absent" });
     });
   });
   const html = `<!DOCTYPE html><html><head><meta charset="UTF-8">
@@ -210,11 +233,18 @@ function CameraScanner({ onDetected, onClose }) {
     streamRef.current?.getTracks().forEach(t => t.stop());
   }, []);
 
-  const handleFound = useCallback((data) => {
+  const handleFound = useCallback((raw) => {
     if (doneRef.current) return;
     doneRef.current = true;
+    // Strip URL wrapper if scanner returned a URL instead of raw token
+    let data = (raw || "").trim();
+    try {
+      const u = new URL(data);
+      const d = u.searchParams.get("data");
+      if (d) data = decodeURIComponent(d);
+    } catch(_) {}
     setDetected(true);
-    setStatus("QR Code detected!");
+    setStatus("QR Code detected: " + data.slice(0, 20) + "...");
     stopCamera();
     setTimeout(() => onDetected(data), 700);
   }, [onDetected, stopCamera]);
@@ -356,23 +386,61 @@ function CameraScanner({ onDetected, onClose }) {
 }
 
 /* ─── Teacher Dashboard ──────────────────────────────────────────────────────── */
-function TeacherDash({ user, sessions }) {
-  const myClasses = CLASSES.filter(c => c.teacher === user.id);
+// Hardcoded fallback classes — used if Firestore /classes collection is empty
+const FALLBACK_CLASSES = [
+  { id:"CS301", name:"Data Structures",  teacherEmail:"adebayo@school.edu" },
+  { id:"CS302", name:"Web Engineering",  teacherEmail:"okonkwo@school.edu" },
+  { id:"CS303", name:"Database Systems", teacherEmail:"adebayo@school.edu" },
+];
+// Hardcoded fallback students — used if Firestore /users collection is empty
+const FALLBACK_STUDENTS = [
+  { studentId:"STU001", name:"Amara Okafor",  avatar:"AO", email:"amara@school.edu"  },
+  { studentId:"STU002", name:"Chidi Nwosu",   avatar:"CN", email:"chidi@school.edu"  },
+  { studentId:"STU003", name:"Fatima Bello",  avatar:"FB", email:"fatima@school.edu" },
+  { studentId:"STU004", name:"Emeka Adeyemi", avatar:"EA", email:"emeka@school.edu"  },
+  { studentId:"STU005", name:"Ngozi Eze",     avatar:"NE", email:"ngozi@school.edu"  },
+  { studentId:"STU006", name:"Tunde Abiodun", avatar:"TA", email:"tunde@school.edu"  },
+  { studentId:"STU007", name:"Halima Musa",   avatar:"HM", email:"halima@school.edu" },
+  { studentId:"STU008", name:"Seun Olawale",  avatar:"SO", email:"seun@school.edu"   },
+];
+
+function TeacherDash({ user, sessions, students, classes }) {
+  // Use Firestore data if available, fall back to hardcoded lists
+  const effectiveClasses  = (classes  && classes.length  > 0) ? classes  : FALLBACK_CLASSES;
+  const effectiveStudents = (students && students.length > 0) ? students : FALLBACK_STUDENTS;
+  const myClasses = effectiveClasses.filter(c =>
+    c.teacherEmail === user.email || c.teacher === user.id
+  );
   const [sel, setSel] = useState(myClasses[0]?.id || "");
   const [dur, setDur] = useState(120);
   const active = sessions[sel];
 
+  const [creating, setCreating] = useState(false);
+
   const createSession = async () => {
-    if (!sel) return;
-    const token = genToken(sel);
-    await setDoc(doc(db, "sessions", sel), {
-      token, classId:sel, duration:dur, active:true, scanned:[],
-      createdAt: serverTimestamp(),
-    });
+    if (!sel || creating) return;
+    setCreating(true);
+    try {
+      const token     = genToken(sel);
+      const expiresAt = Date.now() + dur * 1000; // store exact expiry ms in Firestore
+      await setDoc(doc(db, "sessions", sel), {
+        token, classId:sel, duration:dur,
+        active:true, scanned:[],
+        expiresAt,               // ← key fix: expiry stored server-side
+        createdAt: serverTimestamp(),
+      });
+    } catch(e) {
+      alert("Failed to create session. Check your connection.");
+    }
+    setCreating(false);
   };
 
   const endSession = async () => {
-    await updateDoc(doc(db, "sessions", sel), { active:false });
+    try {
+      await updateDoc(doc(db, "sessions", sel), { active:false });
+    } catch(e) {
+      alert("Failed to end session. Check your connection.");
+    }
   };
 
   return (
@@ -385,11 +453,11 @@ function TeacherDash({ user, sessions }) {
         ))}
       </div>
       {sel && (()=>{
-        const cls = CLASSES.find(c=>c.id===sel);
+        const cls = (classes||[]).find(c=>c.id===sel) || myClasses.find(c=>c.id===sel);
         return (
           <div style={{background:"linear-gradient(135deg,#0d0d1a,#121228)",border:"1px solid #1e1e3a",borderRadius:16,padding:22}}>
             <div style={{fontFamily:"'Space Mono',monospace",color:"#00ff88",fontSize:10,letterSpacing:3,marginBottom:6}}>SELECTED CLASS</div>
-            <div style={{fontSize:22,fontFamily:"'Syne',sans-serif",fontWeight:800,color:"#fff"}}>{cls.name}</div>
+            <div style={{fontSize:22,fontFamily:"'Syne',sans-serif",fontWeight:800,color:"#fff"}}>{cls?.name || sel}</div>
           </div>
         );
       })()}
@@ -405,37 +473,60 @@ function TeacherDash({ user, sessions }) {
               ))}
             </div>
           </div>
-          <button onClick={createSession} style={{padding:"15px",borderRadius:12,border:"none",cursor:"pointer",background:"linear-gradient(135deg,#00ff88,#00ccaa)",color:"#0a0a0f",fontFamily:"'Space Mono',monospace",fontSize:13,fontWeight:700,letterSpacing:2,boxShadow:"0 0 28px rgba(0,255,136,.3)"}}>
-            GENERATE QR SESSION
+          <button onClick={createSession} disabled={creating} style={{padding:"15px",borderRadius:12,border:"none",cursor:creating?"not-allowed":"pointer",background:creating?"rgba(0,255,136,.3)":"linear-gradient(135deg,#00ff88,#00ccaa)",color:creating?"#00ff88":"#0a0a0f",fontFamily:"'Space Mono',monospace",fontSize:13,fontWeight:700,letterSpacing:2,boxShadow:creating?"none":"0 0 28px rgba(0,255,136,.3)",transition:"all .2s"}}>
+            {creating ? "CREATING SESSION..." : "GENERATE QR SESSION"}
           </button>
         </div>
       ) : (
-        <ActiveSession session={active} onEnd={endSession}/>
+        <ActiveSession session={active} onEnd={endSession} students={effectiveStudents}/>
       )}
     </div>
   );
 }
 
 /* ─── Active Session ─────────────────────────────────────────────────────────── */
-function ActiveSession({ session, onEnd }) {
-  const [t, setT]  = useState(session.duration);
+function ActiveSession({ session, onEnd, students }) {
+  // Calculate remaining time from Firestore expiresAt — survives refresh & re-login
+  const calcRemaining = () => {
+    if (session.expiresAt) {
+      const remaining = Math.round((session.expiresAt - Date.now()) / 1000);
+      return Math.max(0, remaining);
+    }
+    return session.duration || 120;
+  };
+
+  const [t, setT]  = useState(calcRemaining);
   const onEndRef   = useRef(onEnd);
   onEndRef.current = onEnd;
 
+  // Re-sync timer if session prop changes (e.g. after Firestore snapshot update)
   useEffect(() => {
-    const id = setInterval(() => setT(x => {
-      if (x <= 1) { clearInterval(id); onEndRef.current(); return 0; }
-      return x - 1;
-    }), 1000);
+    setT(calcRemaining());
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session.expiresAt]);
+
+  useEffect(() => {
+    // If already expired when component mounts, end immediately
+    if (calcRemaining() <= 0) { onEndRef.current(); return; }
+
+    const id = setInterval(() => {
+      const remaining = calcRemaining();
+      setT(remaining);
+      if (remaining <= 0) {
+        clearInterval(id);
+        onEndRef.current();
+      }
+    }, 1000);
     return () => clearInterval(id);
-  }, []);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session.expiresAt]);
 
   return (
     <div style={{display:"flex",flexDirection:"column",gap:18}}>
       <div style={{background:"#0d0d1a",border:"1px solid #1e1e3a",borderRadius:20,padding:28,display:"flex",flexDirection:"column",alignItems:"center",gap:18}}>
         <div style={{fontFamily:"'Space Mono',monospace",fontSize:10,color:"#00ff88",letterSpacing:3}}>SCAN TO MARK ATTENDANCE</div>
         <div style={{padding:14,background:"#fff",borderRadius:14,boxShadow:"0 0 50px rgba(0,255,136,.2)"}}>
-          <img src={qrUrl(session.token)} width={200} height={200} alt="QR Code"/>
+          <QRCanvas token={session.token} size={200}/>
         </div>
         <div style={{position:"relative",width:100,height:100}}>
           <Ring s={t} total={session.duration}/>
@@ -452,7 +543,7 @@ function ActiveSession({ session, onEnd }) {
       <div style={{background:"#0d0d1a",border:"1px solid #1e1e3a",borderRadius:14,overflow:"hidden"}}>
         <div style={{padding:"12px 18px",borderBottom:"1px solid #1e1e3a",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
           <span style={{fontFamily:"'Space Mono',monospace",fontSize:10,color:"#5a5a7a",letterSpacing:2}}>CHECKED IN</span>
-          <span style={{fontFamily:"'Space Mono',monospace",fontSize:13,fontWeight:700,color:"#00ff88"}}>{(session.scanned||[]).length}/{STUDENTS.length}</span>
+          <span style={{fontFamily:"'Space Mono',monospace",fontSize:13,fontWeight:700,color:"#00ff88"}}>{(session.scanned||[]).length}/{students ? students.length : "?"}</span>
         </div>
         {(session.scanned||[]).length === 0
           ? <div style={{padding:20,textAlign:"center",color:"#2a2a4a",fontSize:12,fontFamily:"'Space Mono',monospace"}}>Waiting for students...</div>
@@ -476,13 +567,21 @@ function ActiveSession({ session, onEnd }) {
 }
 
 /* ─── Student Dashboard ──────────────────────────────────────────────────────── */
-function StudentDash({ user, sessions }) {
+function StudentDash({ user, sessions, students, classes }) {
   const [showCam,    setShowCam]    = useState(false);
   const [scanResult, setScanResult] = useState(null);
   const [simming,    setSimming]    = useState(false);
 
-  const handleDetected = useCallback(async (token) => {
+  const handleDetected = useCallback(async (rawToken) => {
     setShowCam(false);
+    // Extract token — handles both raw token and URL-wrapped token
+    // e.g. "https://api.qrserver.com/...?data=ATT-CS301-..." → "ATT-CS301-..."
+    let token = rawToken.trim();
+    try {
+      const url = new URL(token);
+      const dataParam = url.searchParams.get("data");
+      if (dataParam) token = decodeURIComponent(dataParam);
+    } catch(_) { /* not a URL, use as-is */ }
     // Find the matching active session in Firestore data
     const entry = Object.entries(sessions).find(([,s]) => s && s.active && s.token === token);
     if (!entry) { setScanResult({ ok:false, msg:"No matching active session found." }); return; }
@@ -490,17 +589,20 @@ function StudentDash({ user, sessions }) {
     if ((session.scanned||[]).find(x => x.studentId === user.studentId)) {
       setScanResult({ ok:false, msg:"You are already checked in!" }); return;
     }
-    // Write attendance record to Firestore — all devices see it instantly
     try {
       await updateDoc(doc(db, "sessions", classId), {
         scanned: arrayUnion({
           studentId: user.studentId,
+          matricNo:  user.matricNo || user.studentId,
+          fullName:  user.fullName || user.name,
           name:      user.name,
           avatar:    user.avatar,
+          level:     user.level || "",
+          department:user.department || "",
           time:      new Date().toLocaleTimeString(),
         })
       });
-      const cls = CLASSES.find(c => c.id === classId);
+      const cls = (classes||[]).find(c => c.id === classId);
       setScanResult({ ok:true, msg:`Checked into ${cls?.name}!` });
     } catch(e) {
       setScanResult({ ok:false, msg:"Failed to save. Check your connection." });
@@ -512,15 +614,15 @@ function StudentDash({ user, sessions }) {
     setTimeout(() => {
       const entry = Object.entries(sessions).find(([,s]) => s && s.active);
       if (entry) handleDetected(entry[1].token);
-      else setScanResult({ ok:false, msg:"No active session right now." });
+      else setScanResult({ ok:false, msg:"No active session open. Ask teacher to generate QR." });
       setSimming(false);
     }, 1400);
   };
 
   const attended = Object.entries(sessions)
     .filter(([,s]) => s?.scanned?.find(x => x.studentId === user.studentId))
-    .map(([cid]) => CLASSES.find(c => c.id === cid)).filter(Boolean);
-  const total = CLASSES.filter(c => sessions[c.id]).length;
+    .map(([cid]) => (classes||[]).find(c => c.id === cid)).filter(Boolean);
+  const total = (classes||[]).filter(c => sessions[c.id]).length;
   const pct   = total > 0 ? Math.round((attended.length/total)*100) : 0;
 
   return (
@@ -591,25 +693,27 @@ function StudentDash({ user, sessions }) {
 }
 
 /* ─── Reports ────────────────────────────────────────────────────────────────── */
-function Reports({ sessions }) {
+function Reports({ sessions, students, classes }) {
   const [exporting, setExporting] = useState("");
-  const rows = STUDENTS.map(s => {
-    const present = CLASSES.filter(c => sessions[c.id]?.scanned?.find(x => x.studentId === s.studentId)).length;
-    const total   = CLASSES.filter(c => sessions[c.id]).length;
+  const STUDENTS_LIST = students || [];
+  const CLASSES_LIST  = classes  || [];
+  const rows = STUDENTS_LIST.map(s => {
+    const present = CLASSES_LIST.filter(c => sessions[c.id]?.scanned?.find(x => x.studentId === s.studentId)).length;
+    const total   = CLASSES_LIST.filter(c => sessions[c.id]).length;
     const pct     = total > 0 ? Math.round((present/total)*100) : 0;
     return { ...s, present, total, pct };
   });
   const doExport = (type) => {
     setExporting(type);
-    setTimeout(() => { type==="csv"?exportCSV(sessions):exportPDF(sessions); setExporting(""); }, 400);
+    setTimeout(() => { type==="csv"?exportCSV(sessions,students,classes):exportPDF(sessions,students,classes); setExporting(""); }, 400);
   };
 
   return (
     <div style={{display:"flex",flexDirection:"column",gap:20}}>
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12}}>
         {[
-          {label:"STUDENTS", val:STUDENTS.length, col:"#00ff88"},
-          {label:"SESSIONS", val:CLASSES.filter(c=>sessions[c.id]).length, col:"#00aaff"},
+          {label:"STUDENTS", val:STUDENTS_LIST.length, col:"#00ff88"},
+          {label:"SESSIONS", val:CLASSES_LIST.filter(c=>sessions[c.id]).length, col:"#00aaff"},
           {label:"AVG ATT.", val:`${rows.length?Math.round(rows.reduce((a,r)=>a+r.pct,0)/rows.length):0}%`, col:"#ffcc00"},
         ].map(s=>(
           <div key={s.label} style={{background:"#0d0d1a",border:"1px solid #1e1e3a",borderRadius:14,padding:"18px 10px",textAlign:"center"}}>
@@ -625,7 +729,7 @@ function Reports({ sessions }) {
           </button>
         ))}
       </div>
-      {CLASSES.map(cls=>{
+      {CLASSES_LIST.map(cls=>{
         const s = sessions[cls.id];
         if (!s) return null;
         return (
@@ -634,7 +738,7 @@ function Reports({ sessions }) {
               <span style={{fontFamily:"'Syne',sans-serif",fontSize:15,fontWeight:700,color:"#d0d0e0"}}>{cls.name}</span>
               <span style={{fontFamily:"'Space Mono',monospace",fontSize:11,color:"#00ff88"}}>{cls.id}</span>
             </div>
-            {STUDENTS.map(st=>{
+            {STUDENTS_LIST.map(st=>{
               const rec = (s.scanned||[]).find(x => x.studentId === st.studentId);
               return (
                 <div key={st.studentId} style={{padding:"10px 18px",borderBottom:"1px solid #111128",display:"flex",alignItems:"center",gap:12}}>
@@ -670,18 +774,20 @@ function Reports({ sessions }) {
 
 /* ─── App Shell ──────────────────────────────────────────────────────────────── */
 export default function App() {
-  const [user,     setUser]     = useState(null);
-  const [sessions, setSessions] = useState({});
-  const [tab,      setTab]      = useState("main");
-  const [authReady,setAuthReady]= useState(false);
+  const [user,      setUser]      = useState(null);
+  const [sessions,  setSessions]  = useState({});
+  const [students,  setStudents]  = useState([]);   // loaded from Firestore /users
+  const [classes,   setClasses]   = useState([]);   // loaded from Firestore /classes
+  const [tab,       setTab]       = useState("main");
+  const [authReady, setAuthReady] = useState(false);
 
-  // Firebase Auth state listener
+  // Firebase Auth state listener — fetch full profile from Firestore on login
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, (firebaseUser) => {
+    const unsub = onAuthStateChanged(auth, async (firebaseUser) => {
       if (firebaseUser) {
-        const profile = getUserProfile(firebaseUser);
+        const profile = await fetchUserProfile(firebaseUser);
         if (profile) { setUser(profile); setTab(profile.role==="teacher"?"main":"scan"); }
-        else { signOut(auth); setUser(null); }
+        else { await signOut(auth); setUser(null); }
       } else {
         setUser(null);
       }
@@ -690,12 +796,44 @@ export default function App() {
     return unsub;
   }, []);
 
-  // Real-time Firestore listener — sessions collection
+  // Real-time listener — sessions + auto-expire any session past expiresAt
   useEffect(() => {
-    const unsub = onSnapshot(collection(db, "sessions"), (snapshot) => {
+    const unsub = onSnapshot(collection(db, "sessions"), async (snap) => {
       const data = {};
-      snapshot.forEach(d => { data[d.id] = d.data(); });
+      const now  = Date.now();
+      for (const d of snap.docs) {
+        const s = d.data();
+        // Auto-close any session that is still marked active but has expired
+        if (s.active && s.expiresAt && s.expiresAt < now) {
+          try { await updateDoc(doc(db, "sessions", d.id), { active:false }); }
+          catch(_) {}
+          data[d.id] = { ...s, active:false };
+        } else {
+          data[d.id] = s;
+        }
+      }
       setSessions(data);
+    });
+    return unsub;
+  }, []);
+
+  // Real-time listener — users (students list for teacher view & reports)
+  useEffect(() => {
+    const unsub = onSnapshot(collection(db, "users"), (snap) => {
+      const all = snap.docs.map(d => ({
+        ...d.data(),
+        studentId: d.data().matricNo || d.data().staffId || d.id,
+        name: d.data().shortName || d.data().fullName,
+      }));
+      setStudents(all.filter(u => u.role === "student"));
+    });
+    return unsub;
+  }, []);
+
+  // Real-time listener — classes
+  useEffect(() => {
+    const unsub = onSnapshot(collection(db, "classes"), (snap) => {
+      setClasses(snap.docs.map(d => ({ id: d.id, ...d.data() })));
     });
     return unsub;
   }, []);
@@ -705,8 +843,10 @@ export default function App() {
 
   if (!authReady) {
     return (
-      <div style={{minHeight:"100vh",background:"#0a0a0f",display:"flex",alignItems:"center",justifyContent:"center"}}>
-        <div style={{fontFamily:"'Space Mono',monospace",fontSize:12,color:"#3a3a5a",letterSpacing:3}}>LOADING...</div>
+      <div style={{minHeight:"100vh",background:"#0a0a0f",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:16}}>
+        <div style={{width:48,height:48,borderRadius:12,background:"linear-gradient(135deg,#00ff88,#00aacc)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,fontWeight:900,color:"#0a0a0f",fontFamily:"'Space Mono',monospace",animation:"pulse 1.5s ease-in-out infinite"}}>Q</div>
+        <div style={{fontFamily:"'Space Mono',monospace",fontSize:11,color:"#3a3a5a",letterSpacing:3}}>CONNECTING TO FIREBASE...</div>
+        <style>{`@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.6;transform:scale(.95)}}`}</style>
       </div>
     );
   }
@@ -756,9 +896,9 @@ export default function App() {
           </div>
         </div>
         <div style={{width:"100%",maxWidth:520,padding:"22px 20px 0"}}>
-          {tab==="main"    && isTeacher  && <TeacherDash user={user} sessions={sessions}/>}
-          {tab==="scan"    && !isTeacher && <StudentDash user={user} sessions={sessions}/>}
-          {tab==="reports"               && <Reports sessions={sessions}/>}
+          {tab==="main"    && isTeacher  && <TeacherDash user={user} sessions={sessions} students={students} classes={classes}/>}
+          {tab==="scan"    && !isTeacher && <StudentDash user={user} sessions={sessions} students={students} classes={classes}/>}
+          {tab==="reports"               && <Reports sessions={sessions} students={students} classes={classes}/>}
         </div>
       </div>
     </>
